@@ -1,7 +1,17 @@
 import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
 
 import User from "../models/userModel.js";
+import {
+  REFRESH_TOKEN_COOKIE,
+  signAccessToken,
+  issueRefreshToken,
+  verifyRefreshToken,
+  findStoredRefreshToken,
+  revokeRefreshToken,
+  revokeAllRefreshTokens,
+  setAuthCookies,
+  clearAuthCookies,
+} from "../utils/tokenUtils.js";
 import {
   loginSchema,
   registerSchema,
@@ -61,17 +71,11 @@ export const login = async (req, res) => {
     if (!isPasswordValid)
       return res.status(400).json({ message: "Invalid credentials" });
 
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
-      expiresIn: "1d",
-    });
-
-    // Store token in HTTP-only cookie
-    res.cookie("token", token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
-      maxAge: 24 * 60 * 60 * 1000,
-    });
+    // Short-lived access token + long-lived rotating refresh token,
+    // both in HTTP-only cookies
+    const accessToken = signAccessToken(user);
+    const refreshToken = await issueRefreshToken(user, req);
+    setAuthCookies(res, accessToken, refreshToken);
 
     res.json({
       message: "Login successful",
@@ -88,10 +92,91 @@ export const login = async (req, res) => {
   }
 };
 
-// Logout
-export const logout = (req, res) => {
-  res.clearCookie("token");
-  res.json({ message: "Logged out successfully" });
+// Refresh — rotates the refresh token and issues a new access token
+export const refresh = async (req, res) => {
+  try {
+    const token = req.cookies[REFRESH_TOKEN_COOKIE];
+    if (!token) {
+      clearAuthCookies(res);
+      return res.status(401).json({ message: "No refresh token" });
+    }
+
+    let payload;
+    try {
+      payload = verifyRefreshToken(token);
+    } catch {
+      clearAuthCookies(res);
+      return res
+        .status(401)
+        .json({ message: "Refresh token invalid or expired" });
+    }
+
+    const stored = await findStoredRefreshToken(token);
+
+    // A valid signature with no live record means the token was already
+    // rotated or revoked — treat it as reuse and drop every session.
+    if (!stored || stored.revokedAt) {
+      await revokeAllRefreshTokens(payload.id);
+      clearAuthCookies(res);
+      return res.status(401).json({ message: "Refresh token reuse detected" });
+    }
+
+    if (stored.expiresAt <= new Date()) {
+      await revokeRefreshToken(token);
+      clearAuthCookies(res);
+      return res.status(401).json({ message: "Refresh token expired" });
+    }
+
+    const user = await User.findById(payload.id).select("-password");
+    if (!user) {
+      await revokeAllRefreshTokens(payload.id);
+      clearAuthCookies(res);
+      return res.status(401).json({ message: "User no longer exists" });
+    }
+
+    // Rotate: the presented token is retired and replaced
+    await revokeRefreshToken(token);
+    const accessToken = signAccessToken(user);
+    const newRefreshToken = await issueRefreshToken(user, req);
+    setAuthCookies(res, accessToken, newRefreshToken);
+
+    res.json({
+      message: "Token refreshed",
+      user: {
+        id: user._id,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        email: user.email,
+        role: user.role,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// Logout — revokes the current session's refresh token
+export const logout = async (req, res) => {
+  try {
+    const token = req.cookies[REFRESH_TOKEN_COOKIE];
+    if (token) await revokeRefreshToken(token);
+
+    clearAuthCookies(res);
+    res.json({ message: "Logged out successfully" });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// Logout from every device — revokes all of the user's refresh tokens
+export const logoutAll = async (req, res) => {
+  try {
+    await revokeAllRefreshTokens(req.user._id);
+    clearAuthCookies(res);
+    res.json({ message: "Logged out from all devices" });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
 };
 
 // Check Auth
@@ -186,6 +271,12 @@ export const changePassword = async (req, res) => {
     await User.findByIdAndUpdate(req.user._id, {
       password: hashedPassword,
     });
+
+    // Any session opened with the old password is no longer trusted
+    await revokeAllRefreshTokens(req.user._id);
+
+    const refreshToken = await issueRefreshToken(req.user, req);
+    setAuthCookies(res, signAccessToken(req.user), refreshToken);
 
     res.json({ message: "Password changed successfully" });
   } catch (err) {

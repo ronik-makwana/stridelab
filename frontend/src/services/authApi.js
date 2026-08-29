@@ -8,6 +8,10 @@ export const loginUser = (payload) =>
 
 export const logoutUser = () => axiosInstance.post("/auth/logout");
 
+export const logoutAllDevices = () => axiosInstance.post("/auth/logout-all");
+
+export const refreshSession = () => axiosInstance.post("/auth/refresh");
+
 export const checkAuth = () => axiosInstance.get("/auth/check-auth");
 
 export const updateProfile = (payload) =>

@@ -1,5 +1,6 @@
-import dotenv from "dotenv";
-dotenv.config();
+// Must be the first import: ESM evaluates module bodies in import order,
+// so env vars have to be loaded before any module reads process.env.
+import "dotenv/config";
 
 import express from "express";
 import cors from "cors";
